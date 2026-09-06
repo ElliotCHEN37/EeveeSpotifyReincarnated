@@ -176,6 +176,7 @@ final class KaraokeButtonOverlay {
 
         if shouldShow {
             ensureWindowExists()
+            refreshGeometryIfNeeded()
             trackScrolling(of: liveVC)
             window?.isHidden = isScrolledOffScreen
         } else {
@@ -465,6 +466,14 @@ final class KaraokeButtonOverlay {
             // at the moment tracking (re)began.
             baseContentOffsetY = 0
             baseWindowY = restFrame?.origin.y
+            // Apply the CURRENT real scroll offset right away, rather than
+            // leaving the button sitting at raw rest position until the
+            // next scroll event happens to fire. Without this, reopening
+            // Now Playing (or closing karaoke) while already scrolled down
+            // snapped the button to its rest spot and left it there —
+            // visually wrong for however long until the user scrolled again
+            // — even though the anchor itself (above) was already correct.
+            applyScrollOffset(scrollView.contentOffset.y)
             scrollObservation = scrollView.observe(\.contentOffset, options: [.new]) { [weak self] _, change in
                 guard let self = self, let newOffset = change.newValue else { return }
                 // UIScrollView's contentOffset KVO already fires on the main
@@ -480,6 +489,20 @@ final class KaraokeButtonOverlay {
                 // through keeps it exactly in phase.
                 self.applyScrollOffset(newOffset.y)
             }
+            // Establishing the anchor above doesn't itself move the window —
+            // it only sets up the (baseWindowY, baseContentOffsetY) pair that
+            // future contentOffset KVO events get measured against. If the
+            // user doesn't scroll again after this session starts (e.g. they
+            // just close the karaoke view and leave Now Playing exactly
+            // where it already was, already scrolled down), that KVO
+            // observer never fires — nothing "changes" from its point of
+            // view — and the window would be left sitting at restFrame
+            // (from the reset above) even though the actual content is
+            // still scrolled down. This one-time explicit call syncs the
+            // window to wherever the content *actually* is right now, so a
+            // session that starts mid-scroll reflects that immediately
+            // rather than only on the next scroll gesture.
+            applyScrollOffset(scrollView.contentOffset.y)
         }
     }
 
@@ -601,13 +624,24 @@ final class KaraokeButtonOverlay {
         return firstFound
     }
 
-    private func ensureWindowExists() {
-        guard window == nil else { return }
-        guard let scene = UIApplication.shared.connectedScenes
-            .compactMap({ $0 as? UIWindowScene })
-            .first(where: { $0.activationState == .foregroundActive }) else { return }
-
-        let screenBounds = scene.screen.bounds
+    /// Computes the button window's ideal (rest) frame for the scene's
+    /// CURRENT bounds. Split out from ensureWindowExists so it can also be
+    /// re-run later, on bounds changes, not just once at creation.
+    private func idealFrame(in scene: UIWindowScene) -> CGRect {
+        // scene.coordinateSpace.bounds, NOT scene.screen.bounds. The latter
+        // is the full physical device screen and stays that size regardless
+        // of what's actually going on — in iPad Split View or Slide Over,
+        // Spotify's own window only occupies part of the screen, but
+        // scene.screen.bounds doesn't reflect that at all. Computing this
+        // window's geometry against the full screen while Spotify's real
+        // window is smaller/shifted is exactly why the button could end up
+        // floating disconnected from Spotify's own content — visually
+        // "over everything," including whatever app now occupies the rest
+        // of the screen — and why it wouldn't budge when Now Playing itself
+        // got pushed aside: coordinateSpace.bounds is scene-relative and
+        // updates with the scene's actual current size, screen.bounds never
+        // does.
+        let screenBounds = scene.coordinateSpace.bounds
         let safeAreaBottom = scene.windows
             .first(where: { $0.isKeyWindow })?.safeAreaInsets.bottom ?? 34
 
@@ -652,12 +686,52 @@ final class KaraokeButtonOverlay {
         let originX = isPhone
             ? (screenBounds.width - areaWidth) / 2
             : screenBounds.width - areaWidth - trailingInset
-        let frame = CGRect(
+        return CGRect(
             x: originX,
             y: screenBounds.height - safeAreaBottom - bottomInset - areaHeight,
             width: areaWidth,
             height: areaHeight
         )
+    }
+
+    // Last scene coordinateSpace.bounds size this window's geometry was
+    // computed against — checked each poll tick (see refreshGeometryIfNeeded)
+    // so entering/exiting Split View or Slide Over *after* the button
+    // already exists still gets picked up, not just its state at creation.
+    private var lastSceneBoundsSize: CGSize?
+
+    /// Re-run from refresh() every poll tick, cheap CGRect/CGSize math only.
+    /// Recomputes and reapplies geometry when the scene's actual bounds
+    /// changed since last time — the multitasking-layout counterpart to
+    /// ensureWindowExists only ever running its computation once.
+    private func refreshGeometryIfNeeded() {
+        guard let window = window,
+              let scene = window.windowScene else { return }
+        let currentSize = scene.coordinateSpace.bounds.size
+        guard currentSize != lastSceneBoundsSize else { return }
+        lastSceneBoundsSize = currentSize
+
+        let newFrame = idealFrame(in: scene)
+        restFrame = newFrame
+        // Only snap the window itself to the new rest frame when there's no
+        // active scroll-tracking session moving it around right now — the
+        // next trackScrolling "new session" reset (or the immediate
+        // applyScrollOffset call added alongside it) will pick up the
+        // updated restFrame naturally. Forcing it here too, mid-session,
+        // would fight whatever position scrolling had already placed it at.
+        if trackedScrollView == nil {
+            window.frame = newFrame
+        }
+    }
+
+    private func ensureWindowExists() {
+        guard window == nil else { return }
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }) else { return }
+
+        let frame = idealFrame(in: scene)
+        lastSceneBoundsSize = scene.coordinateSpace.bounds.size
 
         let overlayWindow = UIWindow(windowScene: scene)
         overlayWindow.frame = frame
