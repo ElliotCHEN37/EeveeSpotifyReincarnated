@@ -138,6 +138,19 @@ final class KaraokeButtonOverlay {
         let isNowPlayingScreenVisible = !isOnNativeLyricsScreen && KaraokeButtonOverlay.isNowPlayingScreenCurrentlyVisible(liveVC: liveVC)
         let isMinimized = KaraokeButtonOverlay.isNowPlayingScreenMinimized(liveVC: liveVC)
         let hasKaraokeData = KaraokeOverlayPresenter.isAvailableForCurrentTrack()
+        // Catches Spotify's own in-app overlays presented on top of Now
+        // Playing — the custom share sheet (the WhatsApp/Instagram-style
+        // destination picker) being the reported case, but this isn't
+        // specific to that one screen. Those are ordinary presented view
+        // controllers within Spotify's own window, and this window's
+        // higher windowLevel (see ensureWindowExists) puts it above ALL of
+        // Spotify's own window content unconditionally — UIWindow stacking
+        // doesn't interleave with another window's internal view
+        // z-ordering, so there's no way to sit "under" a specific view
+        // within Spotify's own hierarchy. Hiding whenever something's
+        // presented above Now Playing is the only way to actually stay out
+        // from on top of it.
+        let hasOverlayAboveNowPlaying = liveVC.map { KaraokeButtonOverlay.isSomethingPresentedAbove(liveVC: $0) } ?? false
         // !isPresented: while the karaoke view itself is open (full-screen,
         // on top of everything, including this overlay window's level),
         // there's nothing for this button to do, and leaving the window
@@ -150,7 +163,7 @@ final class KaraokeButtonOverlay {
         // is false, the button isn't eligible to show at all regardless of
         // scroll position, and tracking is torn down for real.
         let shouldShow = isNowPlayingScreenVisible && !isMinimized && hasKaraokeData
-            && !KaraokeOverlayPresenter.isPresented
+            && !KaraokeOverlayPresenter.isPresented && !hasOverlayAboveNowPlaying
 
         // Diagnostic only — traces every gate that feeds shouldShow, since
         // this has been the recurring point of breakage (wrong class names,
@@ -168,15 +181,15 @@ final class KaraokeButtonOverlay {
         let diagnostic = "class=\(foundClassName) nearby=\(nearbyClasses) onLyricsScreen=\(isOnNativeLyricsScreen) " +
             "visible=\(isNowPlayingScreenVisible) minimized=\(isMinimized) " +
             "hasData=\(hasKaraokeData) karaokePresented=\(KaraokeOverlayPresenter.isPresented) " +
-            "shouldShow=\(shouldShow)"
+            "overlayAbove=\(hasOverlayAboveNowPlaying) shouldShow=\(shouldShow)"
         if diagnostic != lastLoggedDiagnostic {
             writeDebugLog("[KaraokeButton] \(diagnostic)")
             lastLoggedDiagnostic = diagnostic
         }
 
         if shouldShow {
-            ensureWindowExists()
-            refreshGeometryIfNeeded()
+            ensureWindowExists(liveVC: liveVC)
+            refreshGeometryIfNeeded(liveVC: liveVC)
             trackScrolling(of: liveVC)
             window?.isHidden = isScrolledOffScreen
         } else {
@@ -364,6 +377,29 @@ final class KaraokeButtonOverlay {
 
     private static func findLiveNowPlayingScrollViewController() -> UIViewController? {
         findLiveViewController(matching: liveScrollViewControllerClassNames)
+    }
+
+    /// True if something (a sheet, Spotify's own custom share destination
+    /// picker, an alert presented as a view controller, etc.) is currently
+    /// presented on top of the Now Playing screen. Walks up liveVC's
+    /// `.parent` chain to its outermost ancestor — covering
+    /// UINavigationController/UITabBarController/custom container setups,
+    /// all of which surface their contents via `.parent` the same way —
+    /// then checks THAT ancestor's `.presentedViewController`. Deliberately
+    /// `.presentedViewController`, not `.presentingViewController`: the
+    /// latter would just describe how Now Playing itself got shown, which
+    /// says nothing about anything stacked further on top of it.
+    ///
+    /// KaraokeOverlayPresenter's own karaoke view doesn't affect this check
+    /// — it's a separate UIWindow, not a view-controller presentation, so
+    /// it never touches presentedViewController here (already covered
+    /// separately by the isPresented check above).
+    private static func isSomethingPresentedAbove(liveVC: UIViewController) -> Bool {
+        var top = liveVC
+        while let parent = top.parent {
+            top = parent
+        }
+        return top.presentedViewController != nil
     }
 
     /// Diagnostic-only, not used for any actual show/hide decision: walks
@@ -580,7 +616,14 @@ final class KaraokeButtonOverlay {
         let referenceWindow = scene?.windows.first(where: { $0 !== window }) ?? scene?.windows.first
         let safeAreaTop = referenceWindow?.safeAreaInsets.top ?? 20
         let safeAreaBottom = referenceWindow?.safeAreaInsets.bottom ?? 20
-        let screenHeight = scene?.screen.bounds.height ?? UIScreen.main.bounds.height
+        // coordinateSpace.bounds, not screen.bounds — newFrame itself is
+        // computed relative to the scene's own coordinate space (see
+        // idealFrame), so comparing it against the full physical screen
+        // height here instead would silently break this check in iPad
+        // Split View/Slide Over, where the scene's actual height is smaller
+        // than the device screen: newFrame's range would almost never reach
+        // anywhere near a full-screen-sized threshold.
+        let screenHeight = scene?.coordinateSpace.bounds.height ?? UIScreen.main.bounds.height
         let isOffScreen = newFrame.origin.y <= safeAreaTop || newFrame.maxY >= screenHeight - safeAreaBottom
         isScrolledOffScreen = isOffScreen
         window.isHidden = isOffScreen
@@ -704,9 +747,28 @@ final class KaraokeButtonOverlay {
     /// Recomputes and reapplies geometry when the scene's actual bounds
     /// changed since last time — the multitasking-layout counterpart to
     /// ensureWindowExists only ever running its computation once.
-    private func refreshGeometryIfNeeded() {
-        guard let window = window,
-              let scene = window.windowScene else { return }
+    private func refreshGeometryIfNeeded(liveVC: UIViewController?) {
+        // If Spotify's own Now Playing screen is now hosted in a different
+        // scene than the one this window was created in, there's no way to
+        // move an existing UIWindow to a different UIWindowScene — the only
+        // correct fix is to tear this one down and let the next poll tick's
+        // ensureWindowExists recreate it properly attached. This is the
+        // recovery path for the case resolvedScene's fallback guess below
+        // ever gets it wrong at creation time (e.g. liveVC's own window
+        // wasn't available yet that first tick) — on iPad Split View,
+        // where more than one app's scene can be simultaneously
+        // .foregroundActive, guessing "the first one" could otherwise mean
+        // this window stays attached to a completely unrelated app's scene
+        // indefinitely.
+        if let window = window, let liveScene = liveVC?.view.window?.windowScene, window.windowScene !== liveScene {
+            self.window = nil
+            self.restFrame = nil
+            self.lastSceneBoundsSize = nil
+            stopTrackingScrolling()
+            return
+        }
+
+        guard let window = window, let scene = window.windowScene else { return }
         let currentSize = scene.coordinateSpace.bounds.size
         guard currentSize != lastSceneBoundsSize else { return }
         lastSceneBoundsSize = currentSize
@@ -724,11 +786,30 @@ final class KaraokeButtonOverlay {
         }
     }
 
-    private func ensureWindowExists() {
+    /// Prefers the scene actually hosting Spotify's own Now Playing screen
+    /// over a blind "any foreground-active scene" guess. On iPad, Split View
+    /// runs each app in its own separate UIWindowScene, and BOTH can
+    /// simultaneously report .foregroundActive — guessing "the first one"
+    /// risked attaching this overlay to a completely unrelated app's scene,
+    /// which is what was behind the button floating disconnected from
+    /// Spotify's own content and not reacting when Now Playing itself got
+    /// resized/repositioned within Split View. Falls back to the old guess
+    /// only when liveVC isn't attached to a window yet (shouldn't normally
+    /// happen — this is only called once shouldShow is already true, which
+    /// implies liveVC is on screen — but kept as a safety net rather than
+    /// simply failing to create a window at all in that edge case).
+    private static func resolvedScene(liveVC: UIViewController?) -> UIWindowScene? {
+        if let scene = liveVC?.view.window?.windowScene {
+            return scene
+        }
+        return UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first(where: { $0.activationState == .foregroundActive })
+    }
+
+    private func ensureWindowExists(liveVC: UIViewController?) {
         guard window == nil else { return }
-        guard let scene = UIApplication.shared.connectedScenes
-            .compactMap({ $0 as? UIWindowScene })
-            .first(where: { $0.activationState == .foregroundActive }) else { return }
+        guard let scene = KaraokeButtonOverlay.resolvedScene(liveVC: liveVC) else { return }
 
         let frame = idealFrame(in: scene)
         lastSceneBoundsSize = scene.coordinateSpace.bounds.size
