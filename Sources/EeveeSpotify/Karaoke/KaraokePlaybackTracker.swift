@@ -1,11 +1,8 @@
 import Foundation
+import ObjectiveC.runtime
 
 /// Tracks live playback position and the current track's Spotify ID, for the
-/// karaoke overlay's animation loop. Modeled directly on the same KVC-based
-/// reading pattern SponsorBlockSkipper already uses in production (state.value
-/// (forKey: "position") etc.) — that pattern is proven to work via the real
-/// SPTPlayerServiceImplementation observer hook, so this reuses the exact same
-/// keys rather than rediscovering them.
+/// karaoke overlay's animation loop.
 ///
 /// Kept as its own observer/store (registered separately, see
 /// KaraokeHooks.x.swift) rather than reading through SponsorBlockSkipper
@@ -22,12 +19,48 @@ final class KaraokePlaybackTracker {
     private var lastIsPlaying: Bool = false
     private var lastTrackId: String?
 
+    private var didDumpStateShape = false
+
     private init() {}
 
     /// Call from the player-state-change observer with the raw state object.
+    ///
+    /// The key names below ("track"/"URI"/"position"/"playbackSpeed"/
+    /// "isPlaying") were the assumed shape of the OLD SPTPlayerServiceImplementation
+    /// -addPlayerObserver: callback's state object. As of the 9.1.78 IPA I
+    /// inspected, that whole registration path doesn't exist anymore — the
+    /// real one is SPTEsperantoPlayer (obtained via provideStateObservable(),
+    /// see KaraokeHooks.x.swift) calling didChangeState: with an SPTPlayerState
+    /// object, which is a DIFFERENT class than whatever the old assumed shape
+    /// was modeled on, and its actual property names haven't been confirmed
+    /// yet.
+    ///
+    /// Every value(forKey:) below is now guarded with responds(to:) first —
+    /// calling value(forKey:) with a key the object doesn't actually have
+    /// raises an uncatchable NSException (an actual crash, not a Swift nil),
+    /// so guessing these key names unguarded against a still-unconfirmed
+    /// class would be a real regression risk now that this is actually being
+    /// called (previously safe purely because the broken hook meant this
+    /// function was never invoked in practice). If any of these keys turn
+    /// out wrong, this just silently keeps the previous/default value for
+    /// that field rather than crashing — see the one-time dump below for
+    /// getting the REAL key names for a proper follow-up fix.
     func processStateChange(state: AnyObject) {
-        let trackObj = state.value(forKey: "track") as AnyObject?
-        let uriObj   = trackObj?.value(forKey: "URI")
+        if !didDumpStateShape {
+            didDumpStateShape = true
+            karaokeDumpClassMethods("playerState", of: state)
+        }
+
+        func safeValue(_ key: String) -> Any? {
+            guard state.responds(to: Selector(key)) else { return nil }
+            return state.value(forKey: key)
+        }
+
+        let trackObj = safeValue("track") as AnyObject?
+        let uriObj: Any? = trackObj.flatMap { obj -> Any? in
+            guard obj.responds(to: Selector("URI")) else { return nil }
+            return obj.value(forKey: "URI")
+        }
         let uriString: String = {
             if let s = uriObj as? String { return s }
             if let u = uriObj as? URL { return u.absoluteString }
@@ -40,9 +73,9 @@ final class KaraokePlaybackTracker {
             ? String(uriString.dropFirst("spotify:track:".count))
             : nil
 
-        let positionRaw: Double = (state.value(forKey: "position") as? NSNumber)?.doubleValue ?? 0
-        let playbackSpeed: Double = (state.value(forKey: "playbackSpeed") as? NSNumber)?.doubleValue ?? 1.0
-        let isPlaying: Bool = (state.value(forKey: "isPlaying") as? Bool) ?? false
+        let positionRaw: Double = (safeValue("position") as? NSNumber)?.doubleValue ?? lastPosition
+        let playbackSpeed: Double = (safeValue("playbackSpeed") as? NSNumber)?.doubleValue ?? lastPlaybackSpeed
+        let isPlaying: Bool = (safeValue("isPlaying") as? Bool) ?? lastIsPlaying
 
         queue.async {
             self.lastPosition = positionRaw
