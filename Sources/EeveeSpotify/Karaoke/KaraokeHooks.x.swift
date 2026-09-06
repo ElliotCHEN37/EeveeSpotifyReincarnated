@@ -6,7 +6,24 @@ import ObjectiveC.runtime
 private var karaokeObserverRegistered = false
 private let karaokeObserver = EeveeKaraokeObserver()
 
+// didChangeState: is the confirmed real SPTPlayerObserver protocol method —
+// found via binary string inspection (the type-encoding string
+// `v24@0:8@"<SPTPlayerObserver>"16` next to it confirms the argument is
+// exactly one object conforming to SPTPlayerObserver, matching this single-
+// argument signature). This does NOT match the old, previously-assumed
+// `player(_:stateDidChange:)` shape (two arguments) kept just below for
+// backward compatibility with whatever older Spotify version that
+// convention was originally written for — if this build's real object calls
+// didChangeState:, the two-argument variants below simply never fire, which
+// is harmless (extra unused @objc methods, not a conflict).
 @objc final class EeveeKaraokeObserver: NSObject {
+    @objc func didChangeState(_ newState: AnyObject) {
+        KaraokePlaybackTracker.shared.processStateChange(state: newState)
+        DispatchQueue.main.async {
+            KaraokeGestureTrigger.shared.attachIfNeeded()
+        }
+    }
+
     @objc func player(_ player: AnyObject, stateDidChange newState: AnyObject) {
         KaraokePlaybackTracker.shared.processStateChange(state: newState)
         DispatchQueue.main.async {
@@ -31,6 +48,14 @@ private let karaokeObserver = EeveeKaraokeObserver()
 // SponsorBlock is enabled/active. addPlayerObserver supports multiple
 // observers being registered, so this is additive and doesn't interfere
 // with SponsorBlock's own observer registration.
+//
+// Kept as a fallback for older Spotify versions where
+// SPTPlayerServiceImplementation itself might still have addPlayerObserver:
+// directly (the shape this hook was originally written against). On the
+// 9.1.78 IPA I inspected it doesn't — see KaraokeStateObservableProbeHook
+// below for what actually replaced it on this build — so on that build this
+// hook now just fails to attach (logged, harmless), the same outcome as
+// before this was diagnosed.
 class KaraokePlayerServiceObserverHook: ClassHook<NSObject> {
     typealias Group = KaraokeGroup
 
@@ -75,16 +100,23 @@ struct KaraokeGroup: HookGroup {}
 
 private var didDumpStateObservable = false
 
-// provideStateObservable() is the actual current method on this class (see
-// the [KaraokeProbe] dump from activateKaraokeHooks below) — addPlayerObserver:
-// and removePlayerObserver: don't exist on it at all anymore, which is the
-// real reason KaraokePlayerServiceObserverHook's hook attaches to a class
-// that exists but fails on that specific method: Spotify replaced the old
-// delegate-style registration with what looks like a reactive/observable
-// object returned from here. This hook doesn't try to subscribe to it yet —
-// that needs knowing its real shape first, hence the introspection dump —
-// it only captures-and-passes-through, the same safe pattern already used
-// for provideStatefulPlayer.
+// provideStateObservable() is the real, currently-used method on this class
+// (confirmed via the [KaraokeProbe] PlayerService(...) dump from
+// activateKaraokeHooks below) — addPlayerObserver:/removePlayerObserver:
+// don't exist on SPTPlayerServiceImplementation itself at all anymore.
+// What it returns is a live SPTEsperantoPlayer instance (confirmed via the
+// [KaraokeProbe] stateObservable dump this hook produces below), and THAT
+// object is what actually has addPlayerObserver:/removePlayerObserver: —
+// registering directly on it here, rather than waiting for Spotify's own UI
+// to call addPlayerObserver: on it first, since there's no guarantee of
+// exactly when (or whether, e.g. if the relevant screen is never opened)
+// that would happen on its own.
+//
+// .perform(_:with:) rather than a typed method call: we only have this as
+// AnyObject (Orion's own generic capture, matching provideStatefulPlayer's
+// pattern elsewhere), and addPlayerObserver: is confirmed (via the dump) to
+// exist and take exactly one object argument, so this is a safe, ordinary
+// Objective-C message send — not a guess at an unconfirmed selector.
 class KaraokeStateObservableProbeHook: ClassHook<NSObject> {
     typealias Group = KaraokeGroup
     static var targetName: String { KaraokePlayerServiceObserverHook.targetName }
@@ -94,6 +126,11 @@ class KaraokeStateObservableProbeHook: ClassHook<NSObject> {
         if !didDumpStateObservable {
             didDumpStateObservable = true
             karaokeDumpClassMethods("stateObservable", of: observable)
+        }
+        if !karaokeObserverRegistered {
+            karaokeObserverRegistered = true
+            writeDebugLog("[Karaoke] registering playback observer on SPTEsperantoPlayer via provideStateObservable")
+            _ = observable.perform(Selector(("addPlayerObserver:")), with: karaokeObserver)
         }
         return observable
     }
