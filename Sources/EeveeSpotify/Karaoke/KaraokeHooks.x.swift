@@ -73,6 +73,32 @@ class KaraokePlayerServiceObserverHook: ClassHook<NSObject> {
 
 struct KaraokeGroup: HookGroup {}
 
+private var didDumpStateObservable = false
+
+// provideStateObservable() is the actual current method on this class (see
+// the [KaraokeProbe] dump from activateKaraokeHooks below) — addPlayerObserver:
+// and removePlayerObserver: don't exist on it at all anymore, which is the
+// real reason KaraokePlayerServiceObserverHook's hook attaches to a class
+// that exists but fails on that specific method: Spotify replaced the old
+// delegate-style registration with what looks like a reactive/observable
+// object returned from here. This hook doesn't try to subscribe to it yet —
+// that needs knowing its real shape first, hence the introspection dump —
+// it only captures-and-passes-through, the same safe pattern already used
+// for provideStatefulPlayer.
+class KaraokeStateObservableProbeHook: ClassHook<NSObject> {
+    typealias Group = KaraokeGroup
+    static var targetName: String { KaraokePlayerServiceObserverHook.targetName }
+
+    func provideStateObservable() -> AnyObject {
+        let observable = orig.provideStateObservable()
+        if !didDumpStateObservable {
+            didDumpStateObservable = true
+            karaokeDumpClassMethods("stateObservable", of: observable)
+        }
+        return observable
+    }
+}
+
 func activateKaraokeHooks() {
     // Mirrors the same two-name fallback as KaraokePlayerServiceObserverHook
     // above — this is only the startup diagnostic log, but it should report
